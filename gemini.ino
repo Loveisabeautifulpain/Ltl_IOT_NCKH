@@ -10,6 +10,8 @@
  *
  * ===== BANG CHAN AO (khop template "Smart Fall-Detection Belt") =====
  *  V0  System Status    String          - Labeled Value
+ *      (DEBUG_V0 = 1: kem gia tri dinh / nguong, "!" = da vuot nguong.
+ *       Vd: "Normal | G 2.31!/2.05 Gy 80/110 T 12/55")
  *  V1  Tilt Angle       Double 0..180   - Gauge
  *  V2  Acceleration (G) Double 0..5     - SuperChart
  *  V3  Remote Silence   Integer 0..1    - Button (Push)
@@ -54,6 +56,10 @@
 #define TELEMETRY_MS      1000   // Gui G/Gyro/Goc moi 1 giay (tranh vuot gioi han goi mien phi)
 #define RECONNECT_MS      15000  // Thu ket noi lai Blynk moi 15 giay (chi khi dang IDLE)
 
+// Debug tren o V0 (khong can them datastream)
+#define DEBUG_V0          1      // 1 = V0 hien them gia tri/nguong khi test; 0 = chi trang thai + ly do
+#define V0_NOTE_MS        8000   // Ket qua (vi sao huy / ai tat) giu tren V0 trong 8 giay
+
 // ================= 3. BIEN HE THONG =================
 enum SystemState {
     STATE_IDLE,
@@ -90,6 +96,13 @@ String lastFallType = "";             // Nhanh nao kich hoat (ghi vao thong bao)
 
 // Gia tri cam bien moi nhat (de gui len Blynk)
 float lastG = 1.0, lastGyro = 0, lastTilt = 0;
+float minG = 9.9, peakTilt = 0;       // G nho nhat / goc lon nhat trong 1 giay
+
+// Noi dung bo sung cho V0
+String trigInfo = "";                 // Gia tri da kich hoat nghi ngo, vd "N1 G2.40"
+String v0Note = "";                   // Ket qua gan nhat, vd "Huy N1 G2.40: con cu dong"
+unsigned long v0NoteTime = 0;
+String cancelSource = "";             // Ai/cai gi da huy canh bao
 
 // ================= 4. HAM HO TRO =================
 void readRawMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
@@ -118,6 +131,7 @@ bool isCancelTriggered() {
     // Lenh tat tu xa tu app Blynk (nguoi than)
     if (remoteCancel) {
         remoteCancel = false;
+        cancelSource = "nut app";
         Serial.println(">>> [BLYNK] Nguoi than tat bao dong tu xa.");
         return true;
     }
@@ -132,6 +146,7 @@ bool isCancelTriggered() {
             Serial.print(val2);
             Serial.print(" / Nen: ");
             Serial.println(touchBaseline);
+            cancelSource = "cham GPIO4";
             return true;
         }
     }
@@ -140,6 +155,7 @@ bool isCancelTriggered() {
         char cmd = Serial.read();
         if (cmd == 'c' || cmd == 'C') {
             Serial.println(">>> [LENH SERIAL] Nhan lenh 'c' huy canh bao.");
+            cancelSource = "lenh Serial";
             return true;
         }
     }
@@ -161,6 +177,49 @@ void startCountdown(unsigned long now) {
 }
 
 // ================= 5. BLYNK =================
+// Ghi ket qua de hien tren V0 trong V0_NOTE_MS
+void setV0Note(const String &note) {
+    v0Note = note;
+    v0NoteTime = millis();
+}
+
+// "gia tri/nguong", them "!" neu vuot nguong. Vd: "2.31!/2.05"
+String vsTh(float value, float threshold, int decimals) {
+    return String(value, decimals) + (value > threshold ? "!" : "") + "/" + String(threshold, decimals);
+}
+
+// Tao chuoi cho o System Status (V0)
+String buildStatus(unsigned long now) {
+    String st = STATE_TEXT[currentState];
+    switch (currentState) {
+        case STATE_IDLE:
+            if (v0Note.length() > 0 && now - v0NoteTime < V0_NOTE_MS) return st + " | " + v0Note;
+            if (!DEBUG_V0) return st;
+            st += " | G " + vsTh(lastG, IMPACT_G, 2);
+            if (minG < FREEFALL_G) st += " roi " + String(minG, 2);
+            st += " Gy " + vsTh(lastGyro, COLLAPSE_GYRO, 0) + " T " + vsTh(peakTilt, COLLAPSE_TILT, 0);
+            if (slowTiltStartTime > 0)
+                st += " Guc " + String((now - slowTiltStartTime) / 1000.0, 1) + "/" + String(SLOW_TILT_MS / 1000.0, 1) + "s";
+            return st;
+        case STATE_POST_FALL_CHECK: {
+            st = "Checking " + trigInfo + " " + String((now - stateStartTime) / 1000.0, 1) + "/" +
+                 String(CHECK_TIME_MS / 1000.0, 1) + "s";
+            if (DEBUG_V0) {
+                int pct = (totalCheckSamples > 0) ? (100 * stillCheckSamples / totalCheckSamples) : 0;
+                st += " | yen " + String(pct) + "%/75 T " + String(lastTilt, 0) + "/" + String(COLLAPSE_TILT, 0);
+            }
+            return st;
+        }
+        case STATE_COUNTDOWN: {
+            long left = (COUNTDOWN_MS - (long)(now - stateStartTime)) / 1000 + 1;
+            if (left < 0) left = 0;
+            return String("Countdown ") + left + "s (" + lastFallType + ")";
+        }
+        default:
+            return st + " (" + lastFallType + ")";
+    }
+}
+
 // V3: Nut "Tat bao dong" tren app (che do Push)
 BLYNK_WRITE(V3) {
     if (param.asInt() == 1) remoteCancel = true;
@@ -169,7 +228,7 @@ BLYNK_WRITE(V3) {
 // Khi vua ket noi (hoac ket noi lai): dong bo trang thai, gui bu canh bao bi lo
 BLYNK_CONNECTED() {
     Serial.println(">>> [BLYNK] Da ket noi server.");
-    Blynk.virtualWrite(V0, STATE_TEXT[currentState]);
+    Blynk.virtualWrite(V0, buildStatus(millis()));
     if (pendingAlertEvent) {
         Blynk.logEvent("fall_alert", "Phat hien te nga (" + lastFallType + ") - gui lai sau khi mat mang");
         pendingAlertEvent = false;
@@ -197,14 +256,10 @@ void sendTelemetry(unsigned long now) {
     if (Blynk.connected()) {
         Blynk.virtualWrite(V1, lastTilt);
         Blynk.virtualWrite(V2, lastG);
-        // Trong luc dem nguoc: hien so giay con lai ngay tren o trang thai
-        if (currentState == STATE_COUNTDOWN) {
-            long left = (COUNTDOWN_MS - (long)(now - stateStartTime)) / 1000 + 1;
-            if (left < 0) left = 0;
-            Blynk.virtualWrite(V0, String("Countdown ") + left + "s");
-        }
+        Blynk.virtualWrite(V0, buildStatus(now));   // Cap nhat o trang thai moi giay
     }
-    lastG = 0; lastGyro = 0;   // Bat dau chu ky moi: lay gia tri lon nhat trong 1 giay
+    // Bat dau chu ky moi: lay gia tri lon/nho nhat trong 1 giay
+    lastG = 0; lastGyro = 0; minG = 9.9; peakTilt = 0;
 }
 
 // Goi moi vong lap: phat hien chuyen trang thai de bao len Blynk ngay lap tuc
@@ -214,7 +269,7 @@ void reportStateChange() {
     lastReportedState = currentState;
 
     bool online = Blynk.connected();
-    if (online) Blynk.virtualWrite(V0, STATE_TEXT[currentState]);
+    if (online) Blynk.virtualWrite(V0, buildStatus(millis()));
 
     if (currentState == STATE_ALARM) {
         if (online) {
@@ -340,6 +395,8 @@ void loop() {
     lastG = max(lastG, totalG);
     lastGyro = max(lastGyro, totalGyro);
     lastTilt = tiltAngle;
+    minG = min(minG, totalG);
+    peakTilt = max(peakTilt, tiltAngle);
 
     now = millis();
 
@@ -349,6 +406,7 @@ void loop() {
                 char cmd = Serial.read();
                 if (cmd == 't' || cmd == 'T') {
                     lastFallType = "Thu nghiem Serial";
+                    trigInfo = "TEST";
                     startCountdown(now);
                     Serial.println("\n>>> [TEST NHANH] Chuyen sang DEM NGUOC 10s! Hay cham tay vao GPIO 4...");
                     break;
@@ -376,6 +434,7 @@ void loop() {
                 stateStartTime = now;
                 totalCheckSamples = 0; stillCheckSamples = 0;
                 lastFallType = (now - freeFallTime < 600) ? "Roi tu do + va cham" : "Va cham manh";
+                trigInfo = "N1 G" + String(totalG, 2);
                 Serial.println("\n>>> [NGHI NGO - NHANH 1] Phat hien VA CHAM MANH! Dang kiem tra 2.5s...");
             }
             else if (totalGyro > COLLAPSE_GYRO && tiltAngle > COLLAPSE_TILT) {
@@ -383,6 +442,7 @@ void loop() {
                 stateStartTime = now;
                 totalCheckSamples = 0; stillCheckSamples = 0;
                 lastFallType = "Do nguoi nhanh";
+                trigInfo = "N2 Gy" + String(totalGyro, 0) + " T" + String(tiltAngle, 0);
                 Serial.println("\n>>> [NGHI NGO - NHANH 2] Phat hien DO NGUOI NHANH! Dang kiem tra 2.5s...");
             }
             else if (slowTiltStartTime > 0 && (now - slowTiltStartTime >= SLOW_TILT_MS)) {
@@ -391,6 +451,7 @@ void loop() {
                 slowTiltStartTime = 0;
                 totalCheckSamples = 0; stillCheckSamples = 0;
                 lastFallType = "Guc nguoi tu tu";
+                trigInfo = "N3 T" + String(tiltAngle, 0);
                 Serial.println("\n>>> [NGHI NGO - NHANH 3] Phat hien GUC NGUOI TU TU! Dang kiem tra 2.5s...");
             }
             break;
@@ -399,6 +460,7 @@ void loop() {
             if (now - stateStartTime > SETTLE_TIME_MS) {
                 if (tiltAngle < STANDUP_TILT) {
                     Serial.println(">>> [HUY NGHI NGO] Da dung day / tu the binh thuong.\n");
+                    setV0Note("Huy " + trigInfo + ": dung day T" + String(tiltAngle, 0) + "<" + String(STANDUP_TILT, 0));
                     resetToIdle();
                     break;
                 }
@@ -412,6 +474,8 @@ void loop() {
                     Serial.println("\n!!! [XAC NHAN NGA QUY] Bat dau dem nguoc 10s! CHAM TAY CONG 2 (GPIO 4) DE HUY !!!");
                 } else {
                     Serial.println(">>> [HUY NGHI NGO] Van con cu dong, khong phai bat tinh.\n");
+                    setV0Note("Huy " + trigInfo + ": yen " + String((int)(stillRatio * 100)) + "%/75 T" +
+                              String(tiltAngle, 0) + "/" + String(COLLAPSE_TILT, 0));
                     resetToIdle();
                 }
             }
@@ -421,6 +485,7 @@ void loop() {
             if (isCancelTriggered()) {
                 playCancelSound();
                 Serial.println(">>> [DA HUY THANH CONG] Nguoi dung xac nhan an toan. Quay ve giam sat.\n");
+                setV0Note("Da huy dem nguoc (" + cancelSource + ")");
                 resetToIdle();
                 delay(600);
                 break;
@@ -456,6 +521,7 @@ void loop() {
             if (isCancelTriggered()) {
                 playCancelSound();
                 Serial.println(">>> [DA TAT BAO DONG] Quay ve trang thai giam sat.\n");
+                setV0Note("Da tat bao dong (" + cancelSource + ")");
                 resetToIdle();
                 delay(600);
             }
